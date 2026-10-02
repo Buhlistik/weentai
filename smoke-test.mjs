@@ -88,13 +88,10 @@ try {
   assert.equal((await unverified.wait("error")).code, "unauthorized");
   unverified.ws.close();
 
-  const host = await client("guest", hostEmail, "Austin", randomUUID());
+  const hostUserId = randomUUID();
+  let host = await client("guest", hostEmail, "Austin", hostUserId);
   await host.ready;
   assert.equal((await host.wait("host_ready")).role, "host");
-  const extraHost = await client("guest", hostEmail, "Austin", randomUUID());
-  await extraHost.ready;
-  assert.equal((await extraHost.wait("error")).code, "host_busy");
-  extraHost.ws.close();
   const guest = await client("host", "friend@example.test", "Friend", randomUUID());
   await guest.ready;
   assert.equal((await guest.wait("hello")).role, "guest");
@@ -106,6 +103,12 @@ try {
   assert.equal((await guest.wait("presence")).online, true);
   host.send({ type: "session_start", sessionId, gameSerial: serial, title: "Armored Core 3" });
   assert.equal((await host.wait("session_started")).sessionId, sessionId);
+
+  const staleHost = host;
+  host = await client("guest", hostEmail, "Austin", hostUserId);
+  await host.ready;
+  assert.equal((await staleHost.wait("host_replaced")).type, "host_replaced");
+  assert.equal((await host.wait("host_ready")).role, "host");
 
   guest.send({ type: "request_join", gameSerial: serial });
   await guest.wait("waiting_approval");

@@ -281,8 +281,14 @@ async function handleMessage(ws, context, msg) {
     context.name = displayName(context.user);
     context.role = context.user.email === HOST_EMAIL ? "host" : "guest";
     if (context.role === "host") {
-      if (host && host.ws !== ws) { send(ws, { type: "error", code: "host_busy" }); ws.close(); return; }
-      host = { ws, name: context.name, user: context.user, game: "", gameSerial: "", activeSession: null };
+      if (host && host.ws !== ws) {
+        if (host.user.id !== context.user.id) { send(ws, { type: "error", code: "host_busy" }); ws.close(); return; }
+        send(host.ws, { type: "host_replaced" });
+        host.ws.close();
+        host = { ...host, ws, name: context.name, user: context.user };
+      } else {
+        host = { ws, name: context.name, user: context.user, game: "", gameSerial: "", activeSession: null };
+      }
       send(ws, { type: "host_ready", storageReady: Boolean(pool), role: "host", user: { id: context.user.id, email: context.user.email, name: context.name } });
     } else {
       if (guest && guest !== ws) { send(ws, { type: "error", code: "guest_busy" }); ws.close(); return; }
