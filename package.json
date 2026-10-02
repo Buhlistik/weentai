@@ -7,9 +7,12 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node smoke-test.mjs"
   },
   "dependencies": {
+    "jose": "^6.2.12",
+    "pg": "^8.23.1",
     "ws": "^8.18.3"
   }
 }
