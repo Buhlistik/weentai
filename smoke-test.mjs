@@ -96,13 +96,24 @@ try {
   await guest.ready;
   assert.equal((await guest.wait("hello")).role, "guest");
   assert.equal((await guest.wait("presence")).online, false);
+  const guest2 = await client("guest", "another-friend@example.test", "Friend 2", randomUUID());
+  await guest2.ready;
+  assert.equal((await guest2.wait("hello")).role, "guest");
+  assert.equal((await guest2.wait("presence")).online, false);
+  assert.equal((await guest.wait("presence")).online, false);
 
   host.send({ type: "publish", inviteUrl: "https://stream.moonlightweb.top/test-only",
     game: "Armored Core 3", gameSerial: serial });
   await host.wait("published");
   assert.equal((await guest.wait("presence")).online, true);
+  assert.equal((await guest2.wait("presence")).online, true);
   host.send({ type: "session_start", sessionId, gameSerial: serial, title: "Armored Core 3" });
   assert.equal((await host.wait("session_started")).sessionId, sessionId);
+
+  const otherHost = await client("host", hostEmail, "Impostor", randomUUID());
+  await otherHost.ready;
+  assert.equal((await otherHost.wait("error")).code, "host_busy");
+  otherHost.ws.close();
 
   const staleHost = host;
   host = await client("guest", hostEmail, "Austin", hostUserId);
@@ -113,20 +124,31 @@ try {
   guest.send({ type: "request_join", gameSerial: serial });
   await guest.wait("waiting_approval");
   assert.equal((await host.wait("join_request")).guestName, "Friend");
+  guest2.send({ type: "request_join", gameSerial: serial });
+  await guest2.wait("waiting_approval");
   host.send({ type: "approve" });
   await host.wait("join_sent");
   assert.equal((await guest.wait("join_approved")).sessionId, sessionId);
+  assert.equal((await host.wait("join_request")).guestName, "Friend 2");
+  host.send({ type: "approve" });
+  await host.wait("join_sent");
+  assert.equal((await guest2.wait("join_approved")).sessionId, sessionId);
   guest.send({ type: "guest_started", sessionId, gameSerial: serial });
+  guest2.send({ type: "guest_started", sessionId, gameSerial: serial });
   assert.equal((await guest.wait("guest_started_ack")).sessionId, sessionId);
+  assert.equal((await guest2.wait("guest_started_ack")).sessionId, sessionId);
   assert.equal((await host.wait("guest_started")).guestName, "Friend");
+  assert.equal((await host.wait("guest_started")).guestName, "Friend 2");
   host.send({ type: "stop", hostSeconds: 12 });
   assert.equal((await guest.wait("session_ended")).sessionId, sessionId);
+  assert.equal((await guest2.wait("session_ended")).sessionId, sessionId);
   assert.equal((await host.wait("session_ended_saved")).sessionId, sessionId);
   await guest.wait("host_offline");
   await host.wait("stopped");
   host.ws.close();
   guest.ws.close();
-  console.log("PASS: Neon JWT verification, email-derived host role, session tracking, and host-ended guest notification.");
+  guest2.ws.close();
+  console.log("PASS: Neon JWT verification, Austin-only host enforcement, queued multi-guest approvals, and session tracking.");
 } finally {
   service.kill();
   await new Promise(resolve => authServer.close(resolve));

@@ -22,8 +22,9 @@ const pool = process.env.DATABASE_URL
   : null;
 let schemaPromise = null;
 let host = null;
-let guest = null;
+const guests = new Set();
 let pending = null;
+const pendingQueue = [];
 let invite = null;
 
 const schema = `
@@ -51,6 +52,16 @@ CREATE TABLE IF NOT EXISTS session_ends (
 );
 CREATE INDEX IF NOT EXISTS session_ends_guest_lookup
   ON session_ends (guest_username_key, session_id);
+CREATE TABLE IF NOT EXISTS session_guests (
+  session_id TEXT NOT NULL REFERENCES session_ends(session_id) ON DELETE CASCADE,
+  username_key TEXT NOT NULL,
+  username TEXT NOT NULL,
+  started_at TIMESTAMPTZ NOT NULL,
+  seconds BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (session_id, username_key)
+);
+CREATE INDEX IF NOT EXISTS session_guests_user_lookup
+  ON session_guests (username_key, session_id);
 `;
 
 async function ensureSchema() {
@@ -97,14 +108,34 @@ function safeSeconds(value) {
   const seconds = Number(value);
   return Number.isSafeInteger(seconds) && seconds >= 0 && seconds <= 315_360_000 ? seconds : null;
 }
+function sendGuests(data) {
+  for (const socket of guests) send(socket, data);
+}
 function sendPresence() {
   const online = Boolean(host && invite && invite.expiresAt > Date.now());
-  send(guest, {
+  sendGuests({
     type: "presence", online,
     hostName: host?.name || "",
     game: online ? host?.game || "" : "",
     gameSerial: online ? host?.gameSerial || "" : ""
   });
+}
+function advancePending() {
+  if (pending || !host || !invite || invite.expiresAt <= Date.now()) return;
+  while (pendingQueue.length) {
+    const next = pendingQueue.shift();
+    if (next.guest.readyState !== WebSocket.OPEN) continue;
+    pending = next;
+    send(host.ws, { type: "join_request", guestName: next.name, gameSerial: next.gameSerial });
+    break;
+  }
+}
+function removeGuestRequest(socket) {
+  if (pending?.guest === socket) pending = null;
+  for (let i = pendingQueue.length - 1; i >= 0; i--) {
+    if (pendingQueue[i].guest === socket) pendingQueue.splice(i, 1);
+  }
+  advancePending();
 }
 function validInvite(raw) {
   if (typeof raw !== "string" || raw.length > 1200) return false;
@@ -177,9 +208,11 @@ async function sendPendingEnd(socket, user, sessionId) {
   if (!pool || !validSessionId(sessionId) || !nameKey(user)) return;
   await ensureSchema();
   const result = await pool.query(
-    `SELECT session_id, game_serial, title, started_at, guest_started_at, ended_at
-     FROM session_ends
-     WHERE session_id = $1 AND guest_username_key = $2`,
+    `SELECT e.session_id, e.game_serial, e.title, e.started_at,
+            COALESCE(g.started_at, e.guest_started_at) AS guest_started_at, e.ended_at
+     FROM session_ends e
+     LEFT JOIN session_guests g ON g.session_id = e.session_id AND g.username_key = $2
+     WHERE e.session_id = $1 AND (g.username_key IS NOT NULL OR e.guest_username_key = $2)`,
     [sessionId, nameKey(user)]
   );
   const row = result.rows[0];
@@ -198,18 +231,17 @@ async function finishSession(hostState, reportedHostSeconds = null) {
   const active = hostState?.activeSession;
   if (!active) return null;
   const endedAtMs = Date.now();
+  const endedAt = new Date(endedAtMs).toISOString();
   const hostSeconds = Math.max(0, Math.floor((endedAtMs - Date.parse(active.startedAt)) / 1000));
-  const guestSeconds = active.guestStartedAt
-    ? Math.max(0, Math.floor((endedAtMs - Date.parse(active.guestStartedAt)) / 1000))
-    : 0;
+  const participants = [...active.approvedGuests.values()].filter((player) => player.startedAt);
+  const firstGuest = participants[0] || null;
   const session = {
     type: "session_ended", sessionId: active.id, gameSerial: active.gameSerial,
     title: active.title, startedAt: active.startedAt,
-    guestStartedAt: active.guestStartedAt || null,
-    endedAt: new Date(endedAtMs).toISOString()
+    guestStartedAt: firstGuest?.startedAt || null, endedAt
   };
   let canonicalHostSeconds = null;
-  let canonicalGuestSeconds = null;
+  const guestTotals = new Map();
   if (pool) {
     await ensureSchema();
     const client = await pool.connect();
@@ -221,24 +253,33 @@ async function finishSession(hostState, reportedHostSeconds = null) {
           game_serial, title, started_at, guest_started_at, ended_at, host_seconds, guest_seconds)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
          ON CONFLICT (session_id) DO NOTHING RETURNING session_id`,
-        [active.id, nameKey(hostState.user), displayName(hostState.user), active.guestUser ? nameKey(active.guestUser) : null,
-          active.guestUser ? displayName(active.guestUser) : null, active.gameSerial, active.title, active.startedAt,
-          active.guestStartedAt || null, session.endedAt, hostSeconds, guestSeconds]
+        [active.id, nameKey(hostState.user), displayName(hostState.user), firstGuest ? nameKey(firstGuest.user) : null,
+          firstGuest ? firstGuest.name : null, active.gameSerial, active.title, active.startedAt,
+          firstGuest?.startedAt || null, endedAt, hostSeconds,
+          firstGuest ? Math.max(0, Math.floor((endedAtMs - Date.parse(firstGuest.startedAt)) / 1000)) : 0]
       );
       if (inserted.rowCount) {
         canonicalHostSeconds = await addSessionSeconds(client, hostState.user, active.gameSerial, hostSeconds);
-        if (active.guestUser && guestSeconds > 0)
-          canonicalGuestSeconds = await addSessionSeconds(client, active.guestUser, active.gameSerial, guestSeconds);
+        for (const player of participants) {
+          const seconds = Math.max(0, Math.floor((endedAtMs - Date.parse(player.startedAt)) / 1000));
+          await client.query(
+            `INSERT INTO session_guests (session_id, username_key, username, started_at, seconds)
+             VALUES ($1,$2,$3,$4,$5) ON CONFLICT (session_id, username_key) DO NOTHING`,
+            [active.id, nameKey(player.user), player.name, player.startedAt, seconds]
+          );
+          guestTotals.set(player.user.id, await addSessionSeconds(client, player.user, active.gameSerial, seconds));
+        }
       }
       const hostTotal = safeSeconds(reportedHostSeconds);
-      if (hostTotal !== null)
-        canonicalHostSeconds = await saveHighWater(client, hostState.user, active.gameSerial, hostTotal);
-      if (active.guestUser) {
-        const guestTotal = await client.query(
-          "SELECT seconds FROM game_playtime WHERE username_key = $1 AND game_serial = $2",
-          [nameKey(active.guestUser), active.gameSerial]
-        );
-        canonicalGuestSeconds = Number(guestTotal.rows[0]?.seconds || 0);
+      if (hostTotal !== null) canonicalHostSeconds = await saveHighWater(client, hostState.user, active.gameSerial, hostTotal);
+      for (const player of participants) {
+        if (!guestTotals.has(player.user.id)) {
+          const total = await client.query(
+            "SELECT seconds FROM game_playtime WHERE username_key = $1 AND game_serial = $2",
+            [nameKey(player.user), active.gameSerial]
+          );
+          guestTotals.set(player.user.id, Number(total.rows[0]?.seconds || 0));
+        }
       }
       await client.query("COMMIT");
     } catch (error) {
@@ -249,13 +290,14 @@ async function finishSession(hostState, reportedHostSeconds = null) {
     }
   }
   hostState.activeSession = null;
-  if (active.guestUser) {
-    send(guest, { ...session, hostTotalSeconds: canonicalHostSeconds, guestTotalSeconds: canonicalGuestSeconds });
+  for (const player of participants) {
+    send(player.socket, {
+      ...session, guestStartedAt: player.startedAt,
+      guestTotalSeconds: guestTotals.get(player.user.id) ?? null,
+      hostTotalSeconds: canonicalHostSeconds
+    });
   }
-  send(hostState.ws, {
-    ...session, type: "session_ended_saved",
-    hostTotalSeconds: canonicalHostSeconds
-  });
+  send(hostState.ws, { ...session, type: "session_ended_saved", hostTotalSeconds: canonicalHostSeconds });
   return session;
 }
 
@@ -263,7 +305,8 @@ function clearHost() {
   host = null;
   invite = null;
   pending = null;
-  send(guest, { type: "host_offline" });
+  pendingQueue.length = 0;
+  sendGuests({ type: "host_offline" });
   sendPresence();
 }
 
@@ -291,8 +334,7 @@ async function handleMessage(ws, context, msg) {
       }
       send(ws, { type: "host_ready", storageReady: Boolean(pool), role: "host", user: { id: context.user.id, email: context.user.email, name: context.name } });
     } else {
-      if (guest && guest !== ws) { send(ws, { type: "error", code: "guest_busy" }); ws.close(); return; }
-      guest = ws;
+      guests.add(ws);
       send(ws, { type: "hello", role: "guest", user: { id: context.user.id, email: context.user.email, name: context.name } });
     }
     sendPresence();
@@ -318,22 +360,23 @@ async function handleMessage(ws, context, msg) {
       host.activeSession = {
         id: msg.sessionId, gameSerial: msg.gameSerial,
         title: String(msg.title || host.game || msg.gameSerial).trim().slice(0, 100),
-        startedAt: new Date().toISOString(), guestUser: null, guestStartedAt: null
+        startedAt: new Date().toISOString(), approvedGuests: new Map()
       };
       send(ws, { type: "session_started", sessionId: host.activeSession.id, startedAt: host.activeSession.startedAt });
-    } else if (msg.type === "approve" && pending && pending.guest === guest && invite && invite.expiresAt > Date.now()) {
+    } else if (msg.type === "approve" && pending && invite && invite.expiresAt > Date.now()) {
       if (!host.activeSession || host.activeSession.gameSerial !== invite.gameSerial) {
         send(ws, { type: "error", code: "session_unavailable" }); return;
       }
-      send(guest, { type: "join_approved", inviteUrl: invite.url, gameSerial: invite.gameSerial, sessionId: host.activeSession.id });
+      send(pending.guest, { type: "join_approved", inviteUrl: invite.url, gameSerial: invite.gameSerial, sessionId: host.activeSession.id });
+      host.activeSession.approvedGuests.set(pending.user.id, { user: pending.user, name: pending.name, socket: pending.guest, startedAt: null });
       send(ws, { type: "join_sent" });
-      invite = null; pending = null; sendPresence();
+      pending = null; advancePending();
     } else if (msg.type === "deny" && pending) {
-      send(pending.guest, { type: "join_denied" }); pending = null;
+      send(pending.guest, { type: "join_denied" }); pending = null; advancePending();
     } else if (msg.type === "stop") {
       const ended = await finishSession(host, safeSeconds(msg.hostSeconds));
-      invite = null; pending = null;
-      send(guest, { type: "host_offline" });
+      invite = null; pending = null; pendingQueue.length = 0;
+      sendGuests({ type: "host_offline" });
       send(ws, { type: "stopped", endedSessionId: ended?.sessionId || "" });
       sendPresence();
       return;
@@ -347,7 +390,7 @@ async function handleMessage(ws, context, msg) {
     }
   }
 
-  if (context.role === "guest" && guest === ws) {
+  if (context.role === "guest" && guests.has(ws)) {
     if (msg.type === "request_join") {
       const now = Date.now();
       if (now - context.requestCooldownAt < 5000) { send(ws, { type: "error", code: "wait_before_request" }); return; }
@@ -356,16 +399,18 @@ async function handleMessage(ws, context, msg) {
       if (typeof msg.gameSerial !== "string" || msg.gameSerial !== invite.gameSerial) {
         send(ws, { type: "error", code: "game_unavailable" }); return;
       }
-      pending = { guest: ws, user: context.user, name: context.name, gameSerial: msg.gameSerial };
+      if (pending?.guest !== ws && !pendingQueue.some((item) => item.guest === ws)) {
+        pendingQueue.push({ guest: ws, user: context.user, name: context.name, gameSerial: msg.gameSerial });
+      }
       send(ws, { type: "waiting_approval", gameSerial: msg.gameSerial });
-      send(host.ws, { type: "join_request", guestName: context.name, gameSerial: msg.gameSerial });
+      advancePending();
     } else if (msg.type === "guest_started") {
-      if (!host?.activeSession || msg.sessionId !== host.activeSession.id || host.activeSession.gameSerial !== msg.gameSerial) {
+      const approved = host?.activeSession?.approvedGuests.get(context.user.id);
+      if (!host?.activeSession || msg.sessionId !== host.activeSession.id || host.activeSession.gameSerial !== msg.gameSerial || approved?.socket !== ws) {
         send(ws, { type: "error", code: "session_unavailable" }); return;
       }
       const startedAt = new Date().toISOString();
-      host.activeSession.guestUser = context.user;
-      host.activeSession.guestStartedAt = startedAt;
+      if (!approved.startedAt) approved.startedAt = startedAt;
       send(ws, { type: "guest_started_ack", sessionId: msg.sessionId, startedAt });
       send(host.ws, { type: "guest_started", sessionId: msg.sessionId, guestName: context.name, startedAt });
     } else if (msg.type === "sync_playtime") {
@@ -431,9 +476,9 @@ wss.on("connection", (ws) => {
         await finishSession(host);
         clearHost();
       }
-      if (context.role === "guest" && guest === ws) {
-        guest = null;
-        if (pending?.guest === ws) pending = null;
+      if (context.role === "guest") {
+        guests.delete(ws);
+        removeGuestRequest(ws);
       }
     }).catch((error) => console.error("Presence close failed:", error.message));
   });
