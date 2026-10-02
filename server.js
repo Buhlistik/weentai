@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import pg from "pg";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import { randomUUID } from "node:crypto";
 
 const { Pool } = pg;
 const PORT = Number(process.env.PORT || 10000);
@@ -26,6 +27,7 @@ const guests = new Set();
 let pending = null;
 const pendingQueue = [];
 let invite = null;
+let youtubeRoom = null;
 
 const schema = `
 CREATE TABLE IF NOT EXISTS game_playtime (
@@ -119,6 +121,67 @@ function sendPresence() {
     game: online ? host?.game || "" : "",
     gameSerial: online ? host?.gameSerial || "" : ""
   });
+}
+function youtubeSummary() {
+  return {
+    type: "youtube_presence", online: Boolean(youtubeRoom),
+    roomId: youtubeRoom?.id || "", hostName: youtubeRoom?.hostName || "",
+    guestCount: youtubeRoom?.guests.size || 0,
+    allowGuestsQueue: Boolean(youtubeRoom?.allowGuestsQueue),
+    currentVideo: youtubeRoom?.currentVideo || null
+  };
+}
+function youtubeRoomSnapshot() {
+  if (!youtubeRoom) return { type: "youtube_room_closed" };
+  return {
+    type: "youtube_state", roomId: youtubeRoom.id, hostName: youtubeRoom.hostName,
+    allowGuestsQueue: youtubeRoom.allowGuestsQueue, currentVideo: youtubeRoom.currentVideo,
+    playing: youtubeRoom.playing, position: youtubePosition(), changedAt: youtubeRoom.changedAt,
+    queue: youtubeRoom.queue, members: [youtubeRoom.hostName, ...[...youtubeRoom.guests.values()].map(member => member.name)]
+  };
+}
+function broadcastYoutubeState() {
+  if (!youtubeRoom) return;
+  const snapshot = youtubeRoomSnapshot();
+  send(youtubeRoom.hostWs, snapshot);
+  for (const member of youtubeRoom.guests.values()) send(member.ws, snapshot);
+}
+function youtubePosition() {
+  if (!youtubeRoom) return 0;
+  return Math.max(0, youtubeRoom.position + (youtubeRoom.playing ? (Date.now() - youtubeRoom.changedAt) / 1000 : 0));
+}
+function broadcastYoutubePresence() { sendGuests(youtubeSummary()); }
+function validYoutubeVideo(value) {
+  if (!value || typeof value !== "object" || typeof value.videoId !== "string" || !/^[A-Za-z0-9_-]{11}$/.test(value.videoId)) return null;
+  const clean = text => String(text || "").replace(/[<>]/g, "").trim().slice(0, 180);
+  return { videoId: value.videoId, title: clean(value.title) || "YouTube video", channel: clean(value.channel),
+    thumbnail: /^https:\/\/(i\.ytimg\.com|img\.youtube\.com)\//i.test(String(value.thumbnail || "")) ? value.thumbnail.slice(0, 500) : "",
+    url: "https://www.youtube.com/watch?v=" + value.videoId };
+}
+function isYoutubeMember(ws) { return Boolean(youtubeRoom && (youtubeRoom.hostWs === ws || [...youtubeRoom.guests.values()].some(member => member.ws === ws))); }
+function updateYoutubeVideoTitle(ws, msg) {
+  if (!isYoutubeMember(ws) || typeof msg.videoId !== "string" || youtubeRoom.currentVideo?.videoId !== msg.videoId) return;
+  const title = String(msg.title || "").replace(/[<>]/g, "").trim().slice(0, 180);
+  if (!title || title === youtubeRoom.currentVideo.title) return;
+  youtubeRoom.currentVideo.title = title;
+  broadcastYoutubeState();
+}
+function removeYoutubeGuest(ws) {
+  if (!youtubeRoom) return;
+  if (youtubeRoom.pendingRequest?.ws === ws) youtubeRoom.pendingRequest = null;
+  youtubeRoom.requestQueue = youtubeRoom.requestQueue.filter(request => request.ws !== ws);
+  for (const [id, member] of youtubeRoom.guests) if (member.ws === ws) youtubeRoom.guests.delete(id);
+  youtubeAdvanceRequest(); broadcastYoutubePresence(); broadcastYoutubeState();
+}
+function youtubeAdvanceRequest() {
+  if (!youtubeRoom || youtubeRoom.pendingRequest) return;
+  while (youtubeRoom.requestQueue.length) {
+    const request = youtubeRoom.requestQueue.shift();
+    if (request.ws.readyState !== WebSocket.OPEN) continue;
+    youtubeRoom.pendingRequest = request;
+    send(youtubeRoom.hostWs, { type: "youtube_join_request", guestName: request.name, userId: request.user.id });
+    break;
+  }
 }
 function advancePending() {
   if (pending || !host || !invite || invite.expiresAt <= Date.now()) return;
@@ -306,8 +369,13 @@ function clearHost() {
   invite = null;
   pending = null;
   pendingQueue.length = 0;
+  if (youtubeRoom) {
+    for (const member of youtubeRoom.guests.values()) send(member.ws, { type: "youtube_room_closed" });
+    youtubeRoom = null;
+  }
   sendGuests({ type: "host_offline" });
   sendPresence();
+  broadcastYoutubePresence();
 }
 
 async function handleMessage(ws, context, msg) {
@@ -329,6 +397,7 @@ async function handleMessage(ws, context, msg) {
         send(host.ws, { type: "host_replaced" });
         host.ws.close();
         host = { ...host, ws, name: context.name, user: context.user };
+        if (youtubeRoom) { youtubeRoom.hostWs = ws; broadcastYoutubeState(); }
       } else {
         host = { ws, name: context.name, user: context.user, game: "", gameSerial: "", activeSession: null };
       }
@@ -338,13 +407,84 @@ async function handleMessage(ws, context, msg) {
       send(ws, { type: "hello", role: "guest", user: { id: context.user.id, email: context.user.email, name: context.name } });
     }
     sendPresence();
+    if (context.role === "guest") send(ws, youtubeSummary());
     if (msg.activeSessionId) await sendPendingEnd(ws, context.user, msg.activeSessionId);
     await sendPlaytimeSnapshot(ws, context.user);
     return;
   }
 
   if (context.role === "host" && host?.ws === ws) {
-    if (msg.type === "publish") {
+    if (msg.type === "youtube_video_metadata") {
+      updateYoutubeVideoTitle(ws, msg);
+    } else if (msg.type === "youtube_host_start") {
+      if (youtubeRoom) { send(ws, { type: "youtube_host_started", roomId: youtubeRoom.id }); return; }
+      youtubeRoom = { id: randomUUID(), hostWs: ws, hostUser: context.user, hostName: context.name,
+        allowGuestsQueue: msg.allowGuestsQueue === true, currentVideo: null, playing: false, position: 0,
+        changedAt: Date.now(), queue: [], guests: new Map(), requestQueue: [], pendingRequest: null };
+      send(ws, { type: "youtube_host_started", roomId: youtubeRoom.id });
+      broadcastYoutubePresence(); broadcastYoutubeState();
+    } else if (msg.type === "youtube_host_end") {
+      if (youtubeRoom?.hostWs === ws) {
+        for (const member of youtubeRoom.guests.values()) send(member.ws, { type: "youtube_room_closed" });
+        youtubeRoom = null; broadcastYoutubePresence();
+        send(ws, { type: "youtube_host_ended" });
+      }
+    } else if (msg.type === "youtube_queue_permission") {
+      if (youtubeRoom?.hostWs === ws) {
+        youtubeRoom.allowGuestsQueue = msg.allow === true;
+        broadcastYoutubePresence(); broadcastYoutubeState();
+      }
+    } else if (msg.type === "youtube_approve") {
+      const request = youtubeRoom?.pendingRequest;
+      if (youtubeRoom?.hostWs === ws && request) {
+        youtubeRoom.pendingRequest = null;
+        youtubeRoom.guests.set(request.user.id, { ws: request.ws, user: request.user, name: request.name });
+        send(request.ws, { type: "youtube_join_approved", roomId: youtubeRoom.id });
+        youtubeAdvanceRequest(); broadcastYoutubePresence(); broadcastYoutubeState();
+      }
+    } else if (msg.type === "youtube_deny") {
+      const request = youtubeRoom?.pendingRequest;
+      if (youtubeRoom?.hostWs === ws && request) {
+        send(request.ws, { type: "youtube_join_denied" });
+        youtubeRoom.pendingRequest = null; youtubeAdvanceRequest();
+      }
+    } else if (msg.type === "youtube_queue_add") {
+      const video = validYoutubeVideo(msg.video);
+      if (youtubeRoom?.hostWs === ws || (youtubeRoom?.allowGuestsQueue && isYoutubeMember(ws))) {
+        if (!video || youtubeRoom.queue.length >= 100) { send(ws, { type: "error", code: "youtube_queue_invalid" }); return; }
+        youtubeRoom.queue.push({ ...video, addedBy: context.name });
+        if (!youtubeRoom.currentVideo) {
+          youtubeRoom.currentVideo = youtubeRoom.queue.shift(); youtubeRoom.playing = false;
+          youtubeRoom.position = 0; youtubeRoom.changedAt = Date.now();
+        }
+        broadcastYoutubeState();
+      }
+    } else if (msg.type === "youtube_queue_remove") {
+      if (youtubeRoom?.hostWs === ws) {
+        youtubeRoom.queue = youtubeRoom.queue.filter(item => item.videoId !== msg.videoId);
+        broadcastYoutubeState();
+      }
+    } else if (msg.type === "youtube_control") {
+      if (isYoutubeMember(ws)) {
+        const action = String(msg.action || "");
+        if (action === "play" || action === "pause") {
+          youtubeRoom.position = Math.max(0, Math.min(86400, Number(msg.position) || youtubePosition()));
+          youtubeRoom.playing = action === "play"; youtubeRoom.changedAt = Date.now();
+        } else if (action === "seek") {
+          youtubeRoom.position = Math.max(0, Math.min(86400, Number(msg.position) || 0)); youtubeRoom.changedAt = Date.now();
+        } else if (action === "ended") {
+          if (youtubeRoom.currentVideo?.videoId !== msg.videoId) return;
+          if (youtubeRoom.queue.length) {
+            youtubeRoom.currentVideo = youtubeRoom.queue.shift(); youtubeRoom.position = 0;
+            youtubeRoom.playing = true; youtubeRoom.changedAt = Date.now();
+          } else { youtubeRoom.playing = false; youtubeRoom.position = 0; youtubeRoom.changedAt = Date.now(); }
+        } else if (action === "sync") {
+          youtubeRoom.position = Math.max(0, Math.min(86400, Number(msg.position) || 0));
+          youtubeRoom.playing = msg.playing === true; youtubeRoom.changedAt = Date.now();
+        } else return;
+        broadcastYoutubeState();
+      }
+    } else if (msg.type === "publish") {
       if (!validInvite(msg.inviteUrl)) { send(ws, { type: "error", code: "invalid_invite" }); return; }
       if (!validSerial(msg.gameSerial)) { send(ws, { type: "error", code: "invalid_game" }); return; }
       host.game = String(msg.game || "").trim().slice(0, 100) || msg.gameSerial;
@@ -391,7 +531,36 @@ async function handleMessage(ws, context, msg) {
   }
 
   if (context.role === "guest" && guests.has(ws)) {
-    if (msg.type === "request_join") {
+    if (msg.type === "youtube_video_metadata") {
+      updateYoutubeVideoTitle(ws, msg);
+    } else if (msg.type === "youtube_join_request") {
+      if (!youtubeRoom) { send(ws, { type: "youtube_room_unavailable" }); return; }
+      if (youtubeRoom.guests.has(context.user.id)) { send(ws, { type: "youtube_join_approved", roomId: youtubeRoom.id }); send(ws, youtubeSummary()); send(ws, youtubeRoomSnapshot()); return; }
+      if (youtubeRoom.pendingRequest?.ws !== ws && !youtubeRoom.requestQueue.some(request => request.ws === ws))
+        youtubeRoom.requestQueue.push({ ws, user: context.user, name: context.name });
+      send(ws, { type: "youtube_waiting_approval" }); youtubeAdvanceRequest();
+    } else if (msg.type === "youtube_queue_add") {
+      const video = validYoutubeVideo(msg.video);
+      if (!youtubeRoom?.allowGuestsQueue || !isYoutubeMember(ws)) { send(ws, { type: "error", code: "youtube_queue_forbidden" }); return; }
+      if (!video || youtubeRoom.queue.length >= 100) { send(ws, { type: "error", code: "youtube_queue_invalid" }); return; }
+      youtubeRoom.queue.push({ ...video, addedBy: context.name });
+      if (!youtubeRoom.currentVideo) { youtubeRoom.currentVideo = youtubeRoom.queue.shift(); youtubeRoom.position = 0; youtubeRoom.changedAt = Date.now(); }
+      broadcastYoutubeState();
+    } else if (msg.type === "youtube_control") {
+      if (!isYoutubeMember(ws)) return;
+      const action = String(msg.action || "");
+      if (!["play", "pause", "seek", "sync", "ended"].includes(action)) return;
+      if (action === "ended" && youtubeRoom.currentVideo?.videoId !== msg.videoId) return;
+      if (action === "ended" && youtubeRoom.queue.length) {
+        youtubeRoom.currentVideo = youtubeRoom.queue.shift(); youtubeRoom.position = 0; youtubeRoom.playing = true;
+      } else {
+        youtubeRoom.position = Math.max(0, Math.min(86400, Number(msg.position) || 0));
+        if (action === "play") youtubeRoom.playing = true;
+        if (action === "pause" || action === "ended") youtubeRoom.playing = false;
+        if (action === "sync") youtubeRoom.playing = msg.playing === true;
+      }
+      youtubeRoom.changedAt = Date.now(); broadcastYoutubeState();
+    } else if (msg.type === "request_join") {
       const now = Date.now();
       if (now - context.requestCooldownAt < 5000) { send(ws, { type: "error", code: "wait_before_request" }); return; }
       context.requestCooldownAt = now;
@@ -437,7 +606,7 @@ async function syncPlaytime(socket, user, msg) {
   } finally { client.release(); }
 }
 
-const server = createServer((req, res) => {
+const server = createServer(async (req, res) => {
   if (req.url === "/healthz") {
     res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
     res.end(JSON.stringify({ status: "ok", storageConfigured: Boolean(pool), authConfigured: Boolean(authJwks) }));
@@ -479,6 +648,7 @@ wss.on("connection", (ws) => {
       if (context.role === "guest") {
         guests.delete(ws);
         removeGuestRequest(ws);
+        removeYoutubeGuest(ws);
       }
     }).catch((error) => console.error("Presence close failed:", error.message));
   });

@@ -11,5 +11,15 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: HOST_EMAIL
+        value: austincochrane@gmail.com
       - key: ALLOWED_ORIGINS
         value: https://weentai.gamer.free
+      - key: DATABASE_URL
+        sync: false
+      - key: NEON_AUTH_URL
+        sync: false
+      - key: NEON_AUTH_JWKS_URL
+        sync: false
+      - key: NEON_AUTH_ISSUER
+        sync: false
