@@ -16,7 +16,7 @@ Set these values on the Render service before deploying the authenticated build:
 - DATABASE_URL: Neon Postgres connection string. Keep it secret.
 - NEON_AUTH_URL: Neon Auth base_url for the production branch.
 - NEON_AUTH_JWKS_URL: Neon Auth jwks_url for that same branch.
-- NEON_AUTH_ISSUER: Neon Auth base URL used as the JWT issuer; defaults to NEON_AUTH_URL.
+- The service validates JWT issuers against the origin of NEON_AUTH_URL, as required by Neon Auth.
 - ALLOWED_ORIGINS: https://weentai.gamer.free.
 
 The static site also needs the same NEON_AUTH_URL in auth-config.js. Add the production website domain to Neon Auth trusted domains and enable the sign-in providers you intend to use.

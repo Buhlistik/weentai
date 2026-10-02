@@ -11,6 +11,7 @@ const hostEmail = "austincochrane@gmail.com";
 const port = Number(process.env.WEENTAI_TEST_PORT || 18765);
 const authPort = port + 1;
 const authUrl = "http://127.0.0.1:" + authPort + "/neondb/auth";
+const authIssuer = new URL(authUrl).origin;
 const authJwksUrl = authUrl + "/.well-known/jwks.json";
 const url = "ws://127.0.0.1:" + port + "/ws";
 const { publicKey, privateKey } = await generateKeyPair("ES256");
@@ -50,7 +51,7 @@ async function waitForService() {
 async function makeToken(email, name, id, verified = true) {
   return new SignJWT({ email, name, emailVerified: verified })
     .setProtectedHeader({ alg: "ES256", kid: publicJwk.kid })
-    .setIssuer(authUrl).setSubject(id).setIssuedAt().setExpirationTime("5m")
+    .setIssuer(authIssuer).setSubject(id).setIssuedAt().setExpirationTime("5m")
     .sign(privateKey);
 }
 async function client(requestedRole, email, name, id, verified = true) {
