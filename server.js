@@ -24,7 +24,14 @@ function send(socket, data) {
 }
 
 function sendPresence() {
-  send(guest, { type: "presence", online: Boolean(host && invite && invite.expiresAt > Date.now()), hostName: host?.name || "", game: host?.game || "" });
+  const online = Boolean(host && invite && invite.expiresAt > Date.now());
+  send(guest, {
+    type: "presence",
+    online,
+    hostName: host?.name || "",
+    game: online ? host?.game || "" : "",
+    gameSerial: online ? host?.gameSerial || "" : ""
+  });
 }
 
 function validInvite(raw) {
@@ -74,7 +81,7 @@ wss.on("connection", (ws) => {
       name = String(msg.name || "Player").trim().slice(0, 32) || "Player";
       if (role === "host") {
         if (host && host.ws !== ws) { send(ws, { type: "error", code: "host_busy" }); ws.close(); return; }
-        host = { ws, name, game: "Baldur's Gate: Dark Alliance II" };
+        host = { ws, name, game: "", gameSerial: "" };
         send(ws, { type: "host_ready" });
         sendPresence();
       } else {
@@ -89,11 +96,15 @@ wss.on("connection", (ws) => {
     if (role === "host" && host?.ws === ws) {
       if (msg.type === "publish") {
         if (!validInvite(msg.inviteUrl)) { send(ws, { type: "error", code: "invalid_invite" }); return; }
-        invite = { url: msg.inviteUrl, expiresAt: Date.now() + 120_000 };
-        send(ws, { type: "published" });
+        const gameSerial = typeof msg.gameSerial === "string" && /^[A-Z0-9-]{4,24}$/.test(msg.gameSerial) ? msg.gameSerial : "";
+        if (!gameSerial) { send(ws, { type: "error", code: "invalid_game" }); return; }
+        host.game = String(msg.game || "").trim().slice(0, 100) || gameSerial;
+        host.gameSerial = gameSerial;
+        invite = { url: msg.inviteUrl, gameSerial, expiresAt: Date.now() + 120_000 };
+        send(ws, { type: "published", gameSerial });
         sendPresence();
       } else if (msg.type === "approve" && pending && pending.guest === guest && invite && invite.expiresAt > Date.now()) {
-        send(guest, { type: "join_approved", inviteUrl: invite.url });
+        send(guest, { type: "join_approved", inviteUrl: invite.url, gameSerial: invite.gameSerial });
         send(ws, { type: "join_sent" });
         invite = null;
         pending = null;
@@ -116,9 +127,13 @@ wss.on("connection", (ws) => {
         if (now - requestCooldownAt < 5000) { send(ws, { type: "error", code: "wait_before_request" }); return; }
         requestCooldownAt = now;
         if (!host || !invite || invite.expiresAt <= now) { send(ws, { type: "error", code: "host_unavailable" }); return; }
-        pending = { guest: ws, name };
-        send(ws, { type: "waiting_approval" });
-        send(host.ws, { type: "join_request", guestName: name });
+        if (typeof msg.gameSerial !== "string" || msg.gameSerial !== invite.gameSerial) {
+          send(ws, { type: "error", code: "game_unavailable" });
+          return;
+        }
+        pending = { guest: ws, name, gameSerial: msg.gameSerial };
+        send(ws, { type: "waiting_approval", gameSerial: msg.gameSerial });
+        send(host.ws, { type: "join_request", guestName: name, gameSerial: msg.gameSerial });
       }
     }
   });
