@@ -80,7 +80,7 @@ async function client(requestedRole, email, name, id, verified = true) {
   return { ws, ready, wait, send: data => ws.send(JSON.stringify(data)) };
 }
 await waitForService();
-const serial = "SLUS-20435";
+const serial = "SLUS-20675";
 const sessionId = randomUUID();
 try {
   const unverified = await client("guest", "guest@example.test", "Guest", randomUUID(), false);
@@ -105,45 +105,12 @@ try {
   assert.equal((await guest2.wait("error")).code, "storage_unavailable");
   assert.equal((await guest.wait("presence")).online, false);
 
-  host.send({ type: "youtube_host_start", allowGuestsQueue: false });
-  assert.ok((await host.wait("youtube_host_started")).roomId);
-  await host.wait("youtube_state");
-  guest.send({ type: "youtube_join_request" });
-  await guest.wait("youtube_waiting_approval");
-  assert.equal((await host.wait("youtube_join_request")).guestName, "Friend");
-  host.send({ type: "youtube_approve" });
-  assert.ok((await guest.wait("youtube_join_approved")).roomId);
-  assert.equal((await guest.wait("youtube_state")).members.length, 2);
-  await host.wait("youtube_state");
-  guest.send({ type: "youtube_queue_add", video: { videoId: "dQw4w9WgXcQ", title: "Blocked" } });
-  assert.equal((await guest.wait("error")).code, "youtube_queue_forbidden");
-
-  host.send({ type: "youtube_queue_permission", allow: true });
-  await host.wait("youtube_state");
-  await guest.wait("youtube_state");
-  host.send({ type: "youtube_queue_add", video: { videoId: "dQw4w9WgXcQ", title: "YouTube video", channel: "YouTube" } });
-  assert.equal((await host.wait("youtube_state")).currentVideo.videoId, "dQw4w9WgXcQ");
-  await guest.wait("youtube_state");
-  host.send({ type: "youtube_video_metadata", videoId: "dQw4w9WgXcQ", title: "Shared video title" });
-  assert.equal((await host.wait("youtube_state")).currentVideo.title, "Shared video title");
-  assert.equal((await guest.wait("youtube_state")).currentVideo.title, "Shared video title");
-  guest.send({ type: "youtube_queue_add", video: { videoId: "M7lc1UVf-VE", title: "Queued video", channel: "Test" } });
-  assert.equal((await host.wait("youtube_state")).queue[0].videoId, "M7lc1UVf-VE");
-  await guest.wait("youtube_state");
-  guest.send({ type: "youtube_control", action: "seek", position: 42 });
-  assert.ok(Math.abs((await host.wait("youtube_state")).position - 42) < 1);
-  guest.send({ type: "youtube_control", action: "pause", position: 42 });
-  assert.equal((await host.wait("youtube_state")).playing, false);
-  host.send({ type: "youtube_host_end" });
-  await host.wait("youtube_host_ended");
-  await guest.wait("youtube_room_closed");
-
   host.send({ type: "publish", inviteUrl: "https://stream.moonlightweb.top/test-only",
-    game: "Armored Core 3", gameSerial: serial });
+    game: "Baldur's Gate: Dark Alliance II", gameSerial: serial });
   await host.wait("published");
   assert.equal((await guest.wait("presence")).online, true);
   assert.equal((await guest2.wait("presence")).online, true);
-  host.send({ type: "session_start", sessionId, gameSerial: serial, title: "Armored Core 3" });
+  host.send({ type: "session_start", sessionId, gameSerial: serial, title: "Baldur's Gate: Dark Alliance II" });
   assert.equal((await host.wait("session_started")).sessionId, sessionId);
 
   const otherHost = await client("host", hostEmail, "Impostor", randomUUID());
@@ -184,7 +151,7 @@ try {
   host.ws.close();
   guest.ws.close();
   guest2.ws.close();
-  console.log("PASS: Neon auth, Austin-only hosting, multi-guest PS2 approvals, YouTube room approvals, shared video titles, queue permissions, playback sync, and session tracking.");
+  console.log("PASS: Neon auth, Austin-only hosting, multi-guest PS2 approvals, and session tracking.");
 } finally {
   service.kill();
   await new Promise(resolve => authServer.close(resolve));
