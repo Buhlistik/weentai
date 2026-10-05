@@ -18,8 +18,11 @@ const authJwks = NEON_AUTH_JWKS_URL
     : null;
 const allowedOrigins = new Set((process.env.ALLOWED_ORIGINS || "https://weentai.gamer.free")
   .split(",").map((value) => value.trim()).filter(Boolean));
-const pool = process.env.DATABASE_URL
-  ? new Pool({ connectionString: process.env.DATABASE_URL, max: 4, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 10_000 })
+// Require encrypted Postgres traffic with certificate and hostname verification.
+const databaseUrl = process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL) : null;
+if (databaseUrl) databaseUrl.searchParams.set("sslmode", "verify-full");
+const pool = databaseUrl
+  ? new Pool({ connectionString: databaseUrl.toString(), max: 4, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 10_000 })
   : null;
 let schemaPromise = null;
 let host = null;
