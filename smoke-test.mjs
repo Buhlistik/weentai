@@ -128,6 +128,8 @@ try {
   assert.equal((await host.wait("manga_page")).page, 4);
   await assert.rejects(guest2.wait("manga_page_state", 150), /Timed out waiting for manga_page_state/);
   host.send({ type: "manga_page", page: 12 });
+  assert.equal((await guest.wait("manga_page")).page, 12);
+  host.send({ type: "manga_page", page: 101 });
   await assert.rejects(guest.wait("manga_page", 150), /Timed out waiting for manga_page/);
   guest.send({ type: "manga_leave" });
   await guest.wait("manga_left");
