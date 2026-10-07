@@ -64,12 +64,18 @@ async function client(requestedRole, email, name, id, verified = true) {
     if (index >= 0) waiters.splice(index, 1)[0].resolve(message);
     else queue.push(message);
   });
-  const wait = type => {
+  const wait = (type, timeoutMs = 6000) => {
     const index = queue.findIndex(message => message.type === type);
     if (index >= 0) return Promise.resolve(queue.splice(index, 1)[0]);
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("Timed out waiting for " + type)), 6000);
-      waiters.push({ type, resolve: value => { clearTimeout(timer); resolve(value); } });
+      let timer;
+      const waiter = { type, resolve: value => { clearTimeout(timer); resolve(value); } };
+      timer = setTimeout(() => {
+        const waiterIndex = waiters.indexOf(waiter);
+        if (waiterIndex >= 0) waiters.splice(waiterIndex, 1);
+        reject(new Error("Timed out waiting for " + type));
+      }, timeoutMs);
+      waiters.push(waiter);
     });
   };
   const ready = new Promise((resolve, reject) => {
@@ -104,6 +110,42 @@ try {
   assert.equal((await guest2.wait("presence")).online, false);
   assert.equal((await guest2.wait("error")).code, "storage_unavailable");
   assert.equal((await guest.wait("presence")).online, false);
+  assert.deepEqual((await host.wait("manga_viewers")).viewers, []);
+  assert.deepEqual((await guest.wait("manga_viewers")).viewers, []);
+  assert.deepEqual((await guest2.wait("manga_viewers")).viewers, []);
+
+  host.send({ type: "manga_join" });
+  assert.equal((await host.wait("manga_page_state")).page, 1);
+  assert.deepEqual((await host.wait("manga_viewers")).viewers, ["Austin"]);
+  assert.deepEqual((await guest.wait("manga_viewers")).viewers, ["Austin"]);
+  assert.deepEqual((await guest2.wait("manga_viewers")).viewers, ["Austin"]);
+  guest.send({ type: "manga_join" });
+  assert.equal((await guest.wait("manga_page_state")).page, 1);
+  assert.deepEqual((await host.wait("manga_viewers")).viewers, ["Austin", "Friend"]);
+  assert.deepEqual((await guest.wait("manga_viewers")).viewers, ["Austin", "Friend"]);
+  assert.deepEqual((await guest2.wait("manga_viewers")).viewers, ["Austin", "Friend"]);
+  guest.send({ type: "manga_page", page: 4 });
+  assert.equal((await host.wait("manga_page")).page, 4);
+  await assert.rejects(guest2.wait("manga_page_state", 150), /Timed out waiting for manga_page_state/);
+  host.send({ type: "manga_page", page: 12 });
+  await assert.rejects(guest.wait("manga_page", 150), /Timed out waiting for manga_page/);
+  guest.send({ type: "manga_leave" });
+  await guest.wait("manga_left");
+  assert.deepEqual((await host.wait("manga_viewers")).viewers, ["Austin"]);
+  assert.deepEqual((await guest.wait("manga_viewers")).viewers, ["Austin"]);
+  assert.deepEqual((await guest2.wait("manga_viewers")).viewers, ["Austin"]);
+  host.send({ type: "manga_page", page: 5 });
+  await assert.rejects(guest.wait("manga_page", 150), /Timed out waiting for manga_page/);
+  await assert.rejects(guest2.wait("manga_page", 150), /Timed out waiting for manga_page/);
+  guest2.send({ type: "manga_join" });
+  assert.equal((await guest2.wait("manga_page_state")).page, 5);
+  assert.deepEqual((await host.wait("manga_viewers")).viewers, ["Austin", "Friend 2"]);
+  assert.deepEqual((await guest.wait("manga_viewers")).viewers, ["Austin", "Friend 2"]);
+  assert.deepEqual((await guest2.wait("manga_viewers")).viewers, ["Austin", "Friend 2"]);
+  guest2.send({ type: "manga_leave" });
+  await guest2.wait("manga_left");
+  assert.deepEqual((await host.wait("manga_viewers")).viewers, ["Austin"]);
+  assert.deepEqual((await guest.wait("manga_viewers")).viewers, ["Austin"]);
 
   host.send({ type: "publish", inviteUrl: "https://stream.moonlightweb.top/test-only",
     game: "Baldur's Gate: Dark Alliance II", gameSerial: serial });
@@ -151,7 +193,7 @@ try {
   host.ws.close();
   guest.ws.close();
   guest2.ws.close();
-  console.log("PASS: Neon auth, Austin-only hosting, multi-guest PS2 approvals, and session tracking.");
+  console.log("PASS: Neon auth, shared manga page and viewer sync, Austin-only hosting, multi-guest PS2 approvals, and session tracking.");
 } finally {
   service.kill();
   await new Promise(resolve => authServer.close(resolve));

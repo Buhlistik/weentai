@@ -27,6 +27,9 @@ const pool = databaseUrl
 let schemaPromise = null;
 let host = null;
 const guests = new Set();
+const mangaReaders = new Map();
+const MANGA_PAGE_COUNT = 11;
+let mangaPage = 1;
 let pending = null;
 const pendingQueue = [];
 let invite = null;
@@ -123,6 +126,17 @@ function sendPresence() {
     game: online ? host?.game || "" : "",
     gameSerial: online ? host?.gameSerial || "" : ""
   });
+}
+function mangaViewerNames() {
+  return [...new Set([...mangaReaders.values()].filter(Boolean))].sort((left, right) => left.localeCompare(right));
+}
+function sendMangaViewers(socket) {
+  send(socket, { type: "manga_viewers", viewers: mangaViewerNames() });
+}
+function broadcastMangaViewers() {
+  const message = { type: "manga_viewers", viewers: mangaViewerNames() };
+  send(host?.ws, message);
+  sendGuests(message);
 }
 function advancePending() {
   if (pending || !host || !invite || invite.expiresAt <= Date.now()) return;
@@ -344,6 +358,28 @@ async function handleMessage(ws, context, msg) {
     sendPresence();
     if (msg.activeSessionId) await sendPendingEnd(ws, context.user, msg.activeSessionId);
     await sendPlaytimeSnapshot(ws, context.user);
+    sendMangaViewers(ws);
+    return;
+  }
+
+  if (context.role && msg.type === "manga_join") {
+    mangaReaders.set(ws, context.name);
+    send(ws, { type: "manga_page_state", page: mangaPage });
+    broadcastMangaViewers();
+    return;
+  }
+  if (context.role && msg.type === "manga_leave") {
+    mangaReaders.delete(ws);
+    send(ws, { type: "manga_left" });
+    broadcastMangaViewers();
+    return;
+  }
+  if (context.role && msg.type === "manga_page") {
+    if (!mangaReaders.has(ws) || !Number.isInteger(msg.page) || msg.page < 1 || msg.page > MANGA_PAGE_COUNT) return;
+    mangaPage = msg.page;
+    for (const reader of mangaReaders.keys()) {
+      if (reader !== ws) send(reader, { type: "manga_page", page: mangaPage });
+    }
     return;
   }
 
@@ -476,6 +512,7 @@ wss.on("connection", (ws) => {
   });
   ws.on("close", () => {
     queue = queue.then(async () => {
+      const wasMangaReader = mangaReaders.delete(ws);
       if (context.role === "host" && host?.ws === ws) {
         await finishSession(host);
         clearHost();
@@ -484,6 +521,7 @@ wss.on("connection", (ws) => {
         guests.delete(ws);
         removeGuestRequest(ws);
       }
+      if (wasMangaReader) broadcastMangaViewers();
     }).catch((error) => console.error("Presence close failed:", error.message));
   });
   ws.on("error", () => {});
